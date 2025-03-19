@@ -3,6 +3,103 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.jit
+def _attn_fwd_inner(
+    O_block, # [BLOCK_SIZE_Q, HEAD_DIM]
+    l_i, # [BLOCK_SIZE_Q]
+    m_i, # [BLOCK_SIZE_Q]
+    Q_block, # [BLOCK_SIZE_Q, HEAD_DIM]
+    K_block_ptr,
+    V_block_ptr,
+    softmax_scale,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    offs_q: tl.constexpr, # [BLOCK_SIZE_Q]
+    offs_kv: tl.constexpr, # [BLOCK_SIZE_KV]
+    SEQ_LEN: tl.constexpr,
+):
+
+
+
+@triton.jit
+def _attn_fwd(
+    Q, # [BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM]
+    K, # [BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM]
+    V, # [BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM]
+    softmax_scale, # float32
+    M, # [BATCH_SIZE, NUM_HEADS, SEQ_LEN]
+    O, # [BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM]
+    stride_Q_batch, stride_Q_head, stride_Q_seq, stride_Q_head_dim,
+    stride_K_batch, stride_K_head, stride_K_seq, stride_K_head_dim,
+    stride_V_batch, stride_V_head, stride_V_seq, stride_V_head_dim,
+    stride_O_batch, stride_O_head, stride_O_seq, stride_O_head_dim,
+    BATCH_SIZE, 
+    NUM_HEADS: tl.constexpr, 
+    SEQ_LEN: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    BLOCK_SIZE_KV: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    STAGE: tl.constexpr
+):
+    tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
+
+    # this indicates which block in the sequence length we are processing
+    block_index_q = tl.program_id(0)
+
+    # this indicates which head and batch to process. Each program is associated with a single head and batch
+    index_batch_head = tl.program_id(1)
+
+    index_batch = index_batch_head // NUM_HEADS
+
+    # this indicates which head to process
+    index_head = index_batch_head % NUM_HEADS
+
+    # offset to the correct position in the batch, head and sequence length
+    qvk_offset = (
+        index_batch.to(tl.int64) * stride_Q_batch +
+        index_head.to(tl.int64) * stride_Q_head      
+    ) # this will take us to Q [BATCH_SIZE, NUM_HEADS, :, :]
+
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + qvk_offset, # this will take us to Q [BATCH_SIZE, NUM_HEADS, SEQ_LEN, :]
+        shape=(SEQ_LEN, HEAD_DIM), # resulting shape
+        strides=(stride_Q_seq, stride_Q_head_dim), # strides to move in the resulting shape
+        offsets=(block_index_q * BLOCK_SIZE_Q, 0), # offset to the correct block
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM), # resulting sub division that we are processing
+        order=(1,0), # optimize
+    )
+
+    K_block_ptr = tl.make_block_ptr (
+        base=K + qvk_offset, # this will take us to K [BATCH_SIZE, NUM_HEADS, SEQ_LEN, :]
+        shape=(SEQ_LEN, HEAD_DIM), # resulting shape
+        strides=(stride_K_head_dim, stride_K_seq), # strides to move in the resulting shape
+        offsets=(0, 0), # offset to the correct block
+        block_shape=(HEAD_DIM, BLOCK_SIZE_KV), # resulting sub division that we are processing
+        order=(0,1), # optimize
+    )
+
+    V_block_ptr = tl.make_block_ptr (
+        base=V + qvk_offset, # this will take us to V [BATCH_SIZE, NUM_HEADS, :, :]
+        shape=(SEQ_LEN, HEAD_DIM), # resulting shape
+        strides=(stride_V_seq, stride_V_head_dim), # strides to move in the resulting shape
+        offsets=(0, 0), # offset to the correct block
+        block_shape=(BLOCK_SIZE_KV, HEAD_DIM), # resulting sub division that we are processing
+        order=(1,0), # optimize
+    )
+
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    offs_kv = tl.arange(0, BLOCK_SIZE_KV)
+
+    m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32 - 'inf')
+    l_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0
+    O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
+    Q_block = tl.load(Q_block_ptr)
+
+
+
+
+    
 class TritonAttention(torch.autograd.Function):
 
     @staticmethod
@@ -58,7 +155,13 @@ class TritonAttention(torch.autograd.Function):
             STAGE=stage
         )
 
+        ctx.save_for_backward(Q, K, V, O, M)
+        ctx.grid = grid
+        ctx.scale = scale
+        ctx.HRAD_DIM = HEAD_DIM
+        ctx.causal = causal
 
+        return O
 
 
 
